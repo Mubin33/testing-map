@@ -1,0 +1,94 @@
+@import url('https://fonts.googleapis.com/css2?family=Exo+2:wght@300;400;500;600;700;800&family=JetBrains+Mono:wght@400;500;600&family=Inter:wght@300;400;500&display=swap');
+
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  --font-exo: 'Exo 2', sans-serif;
+  --font-jetbrains: 'JetBrains Mono', monospace;
+  --font-inter: 'Inter', sans-serif;
+
+  --bg: #0a0e1a;
+  --surface-1: #0f1624;
+  --surface-2: #151e2e;
+  --surface-3: #1c2840;
+  --border: #243044;
+  --border-bright: #2e3d58;
+  --text: #e2eaf5;
+  --muted: #5a7090;
+  --accent-amber: #f59e0b;
+  --accent-cyan: #06b6d4;
+  --accent-green: #10b981;
+  --accent-red: #ef4444;
+}
+
+* { box-sizing: border-box; }
+
+html, body, #__next {
+  height: 100%;
+  margin: 0;
+  padding: 0;
+  background: var(--bg);
+  color: var(--text);
+  font-family: var(--font-inter);
+  -webkit-font-smoothing: antialiased;
+}
+
+/* Scrollbar */
+::-webkit-scrollbar { width: 5px; height: 5px; }
+::-webkit-scrollbar-track { background: var(--surface-1); }
+::-webkit-scrollbar-thumb { background: var(--border-bright); border-radius: 3px; }
+::-webkit-scrollbar-thumb:hover { background: var(--muted); }
+
+/* Custom input styling */
+input[type="number"]::-webkit-inner-spin-button,
+input[type="number"]::-webkit-outer-spin-button { opacity: 1; }
+
+/* Map cursor overrides */
+.map-measure-cursor { cursor: crosshair !important; }
+.map-area-cursor { cursor: crosshair !important; }
+
+/* Tooltip */
+.tooltip {
+  position: relative;
+}
+.tooltip::after {
+  content: attr(data-tip);
+  position: absolute;
+  bottom: calc(100% + 6px);
+  left: 50%;
+  transform: translateX(-50%);
+  background: var(--surface-3);
+  border: 1px solid var(--border-bright);
+  color: var(--text);
+  font-size: 11px;
+  padding: 4px 8px;
+  border-radius: 4px;
+  white-space: nowrap;
+  opacity: 0;
+  pointer-events: none;
+  font-family: var(--font-inter);
+  transition: opacity 0.15s;
+  z-index: 50;
+}
+.tooltip:hover::after { opacity: 1; }
+
+/* Glow effects */
+.glow-amber {
+  box-shadow: 0 0 12px -3px rgba(245, 158, 11, 0.4);
+}
+.glow-cyan {
+  box-shadow: 0 0 12px -3px rgba(6, 182, 212, 0.4);
+}
+.glow-green {
+  box-shadow: 0 0 12px -3px rgba(16, 185, 129, 0.35);
+}
+
+/* Animated grid background */
+.grid-bg {
+  background-image: 
+    linear-gradient(rgba(36, 48, 68, 0.4) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(36, 48, 68, 0.4) 1px, transparent 1px);
+  background-size: 32px 32px;
+}

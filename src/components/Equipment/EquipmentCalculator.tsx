@@ -2,17 +2,58 @@
 import { useState, useEffect } from "react";
 import { useDroppable } from "@dnd-kit/core";
 import { Calculator, RotateCcw, Maximize2, ZapOff } from "lucide-react";
-import type { Equipment, FitResult, SelectedArea } from "@/types";
+import type { Equipment, FitResult, PlacedEquipment, SelectedArea } from "@/types";
 import { calculateFit, generateGridPreview } from "@/utils/geometryUtils";
 import { formatArea } from "@/utils/geoUtils";
 
 interface Props {
   selectedArea: SelectedArea | null;
   selectedEquipment: Equipment | null;
+  areas: SelectedArea[];
+  placedEquipment: PlacedEquipment[];
+  onSelectArea: (area: SelectedArea) => void;
+  onRenameArea?: (areaId: string, name: string) => void;
+  onDeleteArea?: (areaId: string) => void;
   onEquipmentDrop: (eq: Equipment) => void;
 }
 
-export default function EquipmentCalculator({ selectedArea, selectedEquipment, onEquipmentDrop }: Props) {
+function pointInArea(point: { lat: number; lng: number }, area: SelectedArea) {
+  if (area.type === "polygon" && area.path) {
+    // Ray casting on the fly is avoided elsewhere; rectangle bounds are enough here.
+    // Polygon path support stays for measurement shapes.
+    let inside = false;
+    for (let i = 0, j = area.path.length - 1; i < area.path.length; j = i++) {
+      const xi = area.path[i].lng;
+      const yi = area.path[i].lat;
+      const xj = area.path[j].lng;
+      const yj = area.path[j].lat;
+      const intersect = yi > point.lat !== yj > point.lat && point.lng < ((xj - xi) * (point.lat - yi)) / (yj - yi + 0.0000001) + xi;
+      if (intersect) inside = !inside;
+    }
+    return inside;
+  }
+
+  if (!area.bounds) return false;
+  return (
+    point.lat <= area.bounds.north &&
+    point.lat >= area.bounds.south &&
+    point.lng <= area.bounds.east &&
+    point.lng >= area.bounds.west
+  );
+}
+
+function groupedCounts(items: PlacedEquipment[]) {
+  const counts = new Map<string, { name: string; count: number }>();
+  for (const item of items) {
+    const key = item.equipment.id;
+    const current = counts.get(key);
+    if (current) current.count += 1;
+    else counts.set(key, { name: item.equipment.name, count: 1 });
+  }
+  return Array.from(counts.values());
+}
+
+export default function EquipmentCalculator({ selectedArea, selectedEquipment, areas, placedEquipment, onSelectArea, onEquipmentDrop }: Props) {
   const [spacingM, setSpacingM] = useState(0.5);
   const [unit, setUnit] = useState<"m" | "ft">("m");
   const [result, setResult] = useState<FitResult | null>(null);
@@ -58,6 +99,16 @@ export default function EquipmentCalculator({ selectedArea, selectedEquipment, o
     : selectedArea;
 
   const gridPreview = result ? generateGridPreview(result.cols, result.rows) : null;
+  const areaSummaries = areas.map((area) => {
+    const items = placedEquipment.filter((item) => pointInArea({ lat: item.lat, lng: item.lng }, area));
+    return {
+      area,
+      items,
+      counts: groupedCounts(items),
+    };
+  });
+  const totalAreaM2 = areaSummaries.reduce((sum, entry) => sum + entry.area.areaM2, 0);
+  const totalPlacedInside = areaSummaries.reduce((sum, entry) => sum + entry.items.length, 0);
 
   return (
     <div className="flex flex-col h-full bg-[var(--surface-1)]">
@@ -76,6 +127,76 @@ export default function EquipmentCalculator({ selectedArea, selectedEquipment, o
       </div>
 
       <div className="flex-1 overflow-y-auto px-4 py-3 space-y-4">
+        {/* AREA OVERVIEW */}
+        <div className="rounded-xl border border-[var(--border)] bg-[var(--surface-2)] p-3">
+          <div className="flex items-center justify-between gap-3 mb-2">
+            <div>
+              <p className="text-xs font-mono text-[var(--muted)] uppercase tracking-wide">Shapes</p>
+              <p className="text-sm font-semibold text-[var(--text)]" style={{ fontFamily: "var(--font-exo)" }}>
+                {areas.length ? `${areas.length} created` : "No shapes yet"}
+              </p>
+            </div>
+            <div className="text-right">
+              <p className="text-[10px] font-mono text-[var(--muted)]">Total area</p>
+              <p className="text-sm font-mono font-semibold text-[var(--accent-cyan)]">{areas.length ? formatArea(totalAreaM2) : "—"}</p>
+            </div>
+          </div>
+
+          {areas.length > 0 && (
+            <div className="space-y-2">
+              {areaSummaries.map(({ area, items, counts }, index) => {
+                const active = selectedArea?.id ? selectedArea.id === area.id : false;
+                return (
+                  <button
+                    key={area.id ?? `${area.label}-${index}`}
+                    onClick={() => onSelectArea(area)}
+                    className={`w-full text-left rounded-lg border px-3 py-2 transition-colors ${active ? "border-[var(--accent-amber)] bg-[rgba(245,158,11,0.08)]" : "border-[var(--border)] hover:border-[var(--border-bright)] bg-[var(--surface-1)]"}`}
+                  >
+                    <div className="flex items-start justify-between gap-2">
+                      <div>
+                        <p className="text-sm font-semibold text-[var(--text)]" style={{ fontFamily: "var(--font-exo)" }}>
+                          {area.name ?? `Shape ${index + 1}`}
+                        </p>
+                        <p className="text-[11px] font-mono text-[var(--muted)]">
+                          {formatArea(area.areaM2)} · {area.widthM.toFixed(1)} × {area.heightM.toFixed(1)} m
+                        </p>
+                      </div>
+                      <div className="text-right">
+                        <p className="text-[10px] font-mono text-[var(--muted)]">Inside</p>
+                        <p className="text-sm font-mono font-semibold text-[var(--accent-green)]">{items.length}</p>
+                      </div>
+                    </div>
+                    {counts.length > 0 ? (
+                      <div className="mt-2 flex flex-wrap gap-1">
+                        {counts.map((entry) => (
+                          <span key={entry.name} className="rounded-full border border-[var(--border)] bg-[var(--surface-2)] px-2 py-0.5 text-[10px] font-mono text-[var(--muted)]">
+                            {entry.name} × {entry.count}
+                          </span>
+                        ))}
+                      </div>
+                    ) : (
+                      <p className="mt-2 text-[10px] font-mono text-[var(--muted)]">No equipment placed inside this shape</p>
+                    )}
+                  </button>
+                );
+              })}
+            </div>
+          )}
+
+          {areas.length > 0 && (
+            <div className="mt-3 grid grid-cols-2 gap-2">
+              <div className="rounded-lg border border-[var(--border)] bg-[var(--surface-1)] px-3 py-2">
+                <p className="text-[10px] font-mono text-[var(--muted)] uppercase tracking-wide">Total placed inside</p>
+                <p className="text-base font-mono font-semibold text-[var(--accent-green)]">{totalPlacedInside}</p>
+              </div>
+              <div className="rounded-lg border border-[var(--border)] bg-[var(--surface-1)] px-3 py-2">
+                <p className="text-[10px] font-mono text-[var(--muted)] uppercase tracking-wide">Equipment on map</p>
+                <p className="text-base font-mono font-semibold text-[var(--accent-cyan)]">{placedEquipment.length}</p>
+              </div>
+            </div>
+          )}
+        </div>
+
         {/* DROP ZONE */}
         <div
           ref={setNodeRef}
@@ -110,8 +231,8 @@ export default function EquipmentCalculator({ selectedArea, selectedEquipment, o
             </div>
           ) : (
             <div className="py-2">
-              <p className="text-sm text-[var(--muted)]">Drop equipment here</p>
-              <p className="text-[11px] text-[var(--muted)] mt-1">or click an item in the list</p>
+              <p className="text-sm text-[var(--muted)]">Select equipment from the list</p>
+              <p className="text-[11px] text-[var(--muted)] mt-1">then drag inside the map square</p>
             </div>
           )}
           {isOver && (

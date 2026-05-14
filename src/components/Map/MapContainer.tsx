@@ -1,15 +1,16 @@
 "use client";
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   GoogleMap,
   useJsApiLoader,
   Polyline,
   Polygon,
   Marker,
+  Rectangle,
   OverlayView,
 } from "@react-google-maps/api";
-import { CopyPlus, RotateCw, Trash2 } from "lucide-react";
-import type { ActiveTool, EquipmentDropRequest, MapView, MeasurePoint, PlacedEquipment, SelectedArea } from "@/types";
+import { RotateCw, Trash2 } from "lucide-react";
+import type { ActiveTool, Equipment, EquipmentDropRequest, MapView, MeasurePoint, PlacedEquipment, SelectedArea } from "@/types";
 import LocationSearch from "@/components/UI/LocationSearch";
 import {
   haversineDistance,
@@ -39,10 +40,19 @@ const MAP_OPTIONS: google.maps.MapOptions = {
   zoomControlOptions: { position: 9 },
 };
 
+type ClientRect = {
+  left: number;
+  right: number;
+  top: number;
+  bottom: number;
+};
+
 interface Props {
   activeTool: ActiveTool;
   mapView: MapView;
   onMapViewChange: (view: MapView) => void;
+  onToolChange: (tool: ActiveTool) => void;
+  areas: SelectedArea[];
   measurePoints: MeasurePoint[];
   isMeasureComplete: boolean;
   onMapClick: (lat: number, lng: number) => void;
@@ -52,13 +62,15 @@ interface Props {
   onRemoveLastPoint?: () => void;
   selectedArea: SelectedArea | null;
   totalDistance?: number;
+  selectedEquipment: Equipment | null;
   placedEquipment: PlacedEquipment[];
   pendingEquipmentDrop: EquipmentDropRequest | null;
   onPendingEquipmentDropHandled: () => void;
   onPlaceEquipment: (equipment: EquipmentDropRequest["equipment"], lat: number, lng: number) => void;
+  onPlaceEquipmentGroup: (groupId: string, equipment: Equipment, positions: { lat: number; lng: number; rotationDeg?: number }[]) => void;
   onMoveEquipment: (id: string, lat: number, lng: number) => void;
   onRotateEquipment: (id: string) => void;
-  onDuplicateEquipment: (id: string) => void;
+  onDuplicateEquipment?: (id: string) => void;
   onDeleteEquipment: (id: string) => void;
 }
 
@@ -68,6 +80,19 @@ function metersPerPixel(lat: number, zoom: number) {
 
 function clampVisualSize(px: number) {
   return Math.max(8, Math.min(2400, px));
+}
+
+function rectsOverlap(a: ClientRect, b: ClientRect) {
+  return a.left < b.right && a.right > b.left && a.top < b.bottom && a.bottom > b.top;
+}
+
+function normalizeClientRect(startX: number, startY: number, currentX: number, currentY: number): ClientRect {
+  return {
+    left: Math.min(startX, currentX),
+    right: Math.max(startX, currentX),
+    top: Math.min(startY, currentY),
+    bottom: Math.max(startY, currentY),
+  };
 }
 
 function sameArea(a: SelectedArea | null, b: SelectedArea | null) {
@@ -114,6 +139,8 @@ export default function MapContainer({
   activeTool,
   mapView,
   onMapViewChange,
+  onToolChange,
+  areas,
   measurePoints,
   isMeasureComplete,
   onMapClick,
@@ -123,13 +150,14 @@ export default function MapContainer({
   onRemoveLastPoint,
   selectedArea,
   totalDistance = 0,
+  selectedEquipment,
   placedEquipment,
   pendingEquipmentDrop,
   onPendingEquipmentDropHandled,
   onPlaceEquipment,
+  onPlaceEquipmentGroup,
   onMoveEquipment,
   onRotateEquipment,
-  onDuplicateEquipment,
   onDeleteEquipment,
 }: Props) {
   const { isLoaded, loadError } = useJsApiLoader({
@@ -140,13 +168,19 @@ export default function MapContainer({
   const mapRef = useRef<google.maps.Map | null>(null);
   const mapShellRef = useRef<HTMLDivElement | null>(null);
   const drawingManagerRef = useRef<google.maps.drawing.DrawingManager | null>(null);
-  const rectangleRef = useRef<google.maps.Rectangle | null>(null);
+  const suppressNextMapClickRef = useRef(false);
   const [mapLoaded, setMapLoaded] = useState(false);
   const [zoom, setZoom] = useState(13);
   const [draggingPlacedId, setDraggingPlacedId] = useState<string | null>(null);
-  const [selectedPlacedId, setSelectedPlacedId] = useState<string | null>(null);
+  const [autoPlacingGroupId, setAutoPlacingGroupId] = useState<string | null>(null);
+  const [selectedPlacedIds, setSelectedPlacedIds] = useState<string[]>([]);
+  const [selectionDrag, setSelectionDrag] = useState<{ startX: number; startY: number; currentX: number; currentY: number } | null>(null);
   const [selectedLocation, setSelectedLocation] = useState<{ lat: number; lng: number; name: string } | null>(null);
   const lastEmittedAreaRef = useRef<SelectedArea | null>(null);
+  const [fixedZoneBounds, setFixedZoneBounds] = useState<{ north: number; south: number; east: number; west: number } | null>(null);
+  
+  // Fixed zone size in pixels at baseline zoom (affects scale with zoom)
+  const FIXED_ZONE_SIZE_PX = 500;
 
   const emitAreaSelected = useCallback(
     (nextArea: SelectedArea) => {
@@ -168,211 +202,11 @@ export default function MapContainer({
   useEffect(() => {
     if (!mapLoaded || !mapRef.current) return;
     const map = mapRef.current;
-    const currentCenter = map.getCenter();
-    if (!currentCenter || currentCenter.lat() !== mapView.center.lat || currentCenter.lng() !== mapView.center.lng) {
-      map.setCenter(mapView.center);
-    }
     if ((map.getZoom() ?? 13) !== mapView.zoom) {
       map.setZoom(mapView.zoom);
     }
     setZoom(mapView.zoom);
   }, [mapLoaded, mapView]);
-
-  useEffect(() => {
-    if (!mapLoaded || !mapRef.current) return;
-    const map = mapRef.current;
-
-    const emitView = () => {
-      const center = map.getCenter();
-      if (!center) return;
-      onMapViewChange({
-        center: { lat: center.lat(), lng: center.lng() },
-        zoom: map.getZoom() ?? 13,
-      });
-      setZoom(map.getZoom() ?? 13);
-    };
-
-    const idleListener = map.addListener("idle", emitView);
-    const zoomListener = map.addListener("zoom_changed", emitView);
-    emitView();
-
-    return () => {
-      idleListener.remove();
-      zoomListener.remove();
-    };
-  }, [mapLoaded, onMapViewChange]);
-
-  // Setup Drawing Manager for area tool
-  useEffect(() => {
-    if (!mapLoaded || !mapRef.current) return;
-    const maps = window.google.maps;
-
-    if (!drawingManagerRef.current) {
-      const dm = new maps.drawing.DrawingManager({
-        drawingMode: null,
-        drawingControl: false,
-        rectangleOptions: {
-          fillColor: "#f59e0b",
-          fillOpacity: 0.15,
-          strokeColor: "#f59e0b",
-          strokeWeight: 2,
-          strokeOpacity: 0.9,
-          editable: true,
-          draggable: true,
-        },
-      });
-      dm.setMap(mapRef.current);
-      drawingManagerRef.current = dm;
-
-      maps.event.addListener(dm, "rectanglecomplete", (rect: google.maps.Rectangle) => {
-        // Remove old rectangle
-        if (rectangleRef.current) rectangleRef.current.setMap(null);
-        rectangleRef.current = rect;
-
-        const handleBoundsChange = () => {
-          const bounds = rect.getBounds();
-          if (!bounds) return;
-          const ne = bounds.getNorthEast();
-          const sw = bounds.getSouthWest();
-          const { areaM2, widthM, heightM } = boundsToAreaMeters(
-            { lat: ne.lat(), lng: ne.lng() },
-            { lat: sw.lat(), lng: sw.lng() }
-          );
-          emitAreaSelected({
-            type: "rectangle",
-            areaM2,
-            widthM: Math.max(widthM, heightM),
-            heightM: Math.min(widthM, heightM),
-            label: `${Math.max(widthM, heightM).toFixed(1)}m x ${Math.min(widthM, heightM).toFixed(1)}m`,
-            bounds: {
-              north: ne.lat(),
-              south: sw.lat(),
-              east: ne.lng(),
-              west: sw.lng(),
-            },
-            center: {
-              lat: bounds.getCenter().lat(),
-              lng: bounds.getCenter().lng(),
-            },
-          });
-        };
-
-        handleBoundsChange();
-        maps.event.addListener(rect, "bounds_changed", handleBoundsChange);
-        dm.setDrawingMode(null);
-      });
-    }
-  }, [emitAreaSelected, mapLoaded]);
-
-  // Sync drawing mode with active tool
-  useEffect(() => {
-    if (!drawingManagerRef.current) return;
-    const maps = window.google?.maps;
-    if (!maps) return;
-    if (activeTool === "area") {
-      drawingManagerRef.current.setDrawingMode(maps.drawing.OverlayType.RECTANGLE);
-    } else {
-      drawingManagerRef.current.setDrawingMode(null);
-    }
-  }, [activeTool]);
-
-  // Clear area
-  useEffect(() => {
-    if (!selectedArea || selectedArea.type !== "rectangle") {
-      if (rectangleRef.current) rectangleRef.current.setMap(null);
-      rectangleRef.current = null;
-      if (!selectedArea) lastEmittedAreaRef.current = null;
-      return;
-    }
-    if (selectedArea.type === "rectangle" && !selectedArea.bounds && rectangleRef.current) {
-      rectangleRef.current.setMap(null);
-      rectangleRef.current = null;
-    }
-  }, [selectedArea]);
-
-  useEffect(() => {
-    if (!mapLoaded || !mapRef.current || !selectedArea || selectedArea.type !== "rectangle" || !selectedArea.bounds) return;
-    const maps = window.google.maps;
-    let rect = rectangleRef.current;
-
-    if (!rect) {
-      rect = new maps.Rectangle({
-        bounds: selectedArea.bounds,
-        editable: true,
-        draggable: true,
-        fillColor: "#e3e3e3",
-        fillOpacity: 0.15,
-        strokeColor: "#e3e3e3",
-        strokeWeight: 1,
-        strokeOpacity: 0.9,
-      });
-      rect.setMap(mapRef.current);
-      rectangleRef.current = rect;
-    } else {
-      const currentBounds = rect.getBounds();
-      const nextBounds = selectedArea.bounds;
-      const changed =
-        !currentBounds ||
-        currentBounds.getNorthEast().lat() !== nextBounds.north ||
-        currentBounds.getSouthWest().lat() !== nextBounds.south ||
-        currentBounds.getNorthEast().lng() !== nextBounds.east ||
-        currentBounds.getSouthWest().lng() !== nextBounds.west;
-      if (changed) {
-        rect.setBounds(nextBounds);
-      }
-    }
-
-    const syncBounds = () => {
-      const bounds = rect.getBounds();
-      if (!bounds) return;
-      const ne = bounds.getNorthEast();
-      const sw = bounds.getSouthWest();
-      const { areaM2, widthM, heightM } = boundsToAreaMeters(
-        { lat: ne.lat(), lng: ne.lng() },
-        { lat: sw.lat(), lng: sw.lng() }
-      );
-      emitAreaSelected({
-        type: "rectangle",
-        areaM2,
-        widthM: Math.max(widthM, heightM),
-        heightM: Math.min(widthM, heightM),
-        label: `${Math.max(widthM, heightM).toFixed(1)}m x ${Math.min(widthM, heightM).toFixed(1)}m`,
-        bounds: {
-          north: ne.lat(),
-          south: sw.lat(),
-          east: ne.lng(),
-          west: sw.lng(),
-        },
-        center: {
-          lat: bounds.getCenter().lat(),
-          lng: bounds.getCenter().lng(),
-        },
-      });
-    };
-
-    syncBounds();
-    const listener = maps.event.addListener(rect, "bounds_changed", syncBounds);
-    return () => {
-      listener.remove();
-    };
-  }, [emitAreaSelected, mapLoaded, selectedArea]);
-
-  useEffect(() => {
-    if (!isMeasureComplete || measurePoints.length < 3) return;
-    const areaM2 = polygonArea(measurePoints);
-    const bounds = polygonBounds(measurePoints);
-    const { widthM, heightM } = boundsDimensionsMeters(bounds);
-    emitAreaSelected({
-      type: "polygon",
-      areaM2,
-      widthM,
-      heightM,
-      label: `${widthM.toFixed(1)}m x ${heightM.toFixed(1)}m`,
-      path: measurePoints,
-      bounds,
-      center: polygonCenter(measurePoints),
-    });
-  }, [emitAreaSelected, isMeasureComplete, measurePoints]);
 
   const clientPointToLatLng = useCallback((clientX: number, clientY: number) => {
     const map = mapRef.current;
@@ -398,38 +232,472 @@ export default function MapContainer({
     return latLng ? { lat: latLng.lat(), lng: latLng.lng() } : null;
   }, []);
 
-  const pointIsInsideSelectedArea = useCallback(
-    (point: { lat: number; lng: number }) => {
-      if (!selectedArea) return false;
-      if (selectedArea.type === "polygon" && selectedArea.path) {
-        return isPointInPolygon(point, selectedArea.path);
-      }
-      if (selectedArea.bounds) {
-        return (
-          point.lat <= selectedArea.bounds.north &&
-          point.lat >= selectedArea.bounds.south &&
-          point.lng <= selectedArea.bounds.east &&
-          point.lng >= selectedArea.bounds.west
-        );
-      }
-      return false;
+  const latLngToClientPoint = useCallback((lat: number, lng: number) => {
+    const map = mapRef.current;
+    const shell = mapShellRef.current;
+    const projection = map?.getProjection();
+    const center = map?.getCenter();
+    const mapZoom = map?.getZoom();
+    if (!map || !shell || !projection || !center || mapZoom == null) return null;
+
+    const rect = shell.getBoundingClientRect();
+    const scale = 2 ** mapZoom;
+    const centerPoint = projection.fromLatLngToPoint(center);
+    const targetPoint = projection.fromLatLngToPoint(new google.maps.LatLng(lat, lng));
+    if (!centerPoint || !targetPoint) return null;
+
+    return {
+      x: rect.left + rect.width / 2 + (targetPoint.x - centerPoint.x) * scale,
+      y: rect.top + rect.height / 2 + (targetPoint.y - centerPoint.y) * scale,
+    };
+  }, []);
+
+  const getEquipmentClientRect = useCallback(
+    (item: PlacedEquipment, pointOverride?: { lat: number; lng: number }) => {
+      const lat = pointOverride?.lat ?? item.lat;
+      const lng = pointOverride?.lng ?? item.lng;
+      const center = latLngToClientPoint(lat, lng);
+      if (!center) return null;
+
+      const mpp = metersPerPixel(lat, zoom);
+      const widthPx = clampVisualSize(item.equipment.lengthM / mpp);
+      const heightPx = clampVisualSize(item.equipment.widthM / mpp);
+      const radians = ((item.rotationDeg % 180) * Math.PI) / 180;
+      const rotatedWidth = Math.abs(widthPx * Math.cos(radians)) + Math.abs(heightPx * Math.sin(radians));
+      const rotatedHeight = Math.abs(widthPx * Math.sin(radians)) + Math.abs(heightPx * Math.cos(radians));
+
+      return {
+        left: center.x - rotatedWidth / 2,
+        right: center.x + rotatedWidth / 2,
+        top: center.y - rotatedHeight / 2,
+        bottom: center.y + rotatedHeight / 2,
+      };
     },
-    [selectedArea]
+    [latLngToClientPoint, zoom]
+  );
+
+  const itemWouldOverlap = useCallback(
+    (
+      item: PlacedEquipment,
+      pointOverride?: { lat: number; lng: number },
+      rotationOverride?: number,
+      ignoredIds: Set<string> = new Set([item.id])
+    ) => {
+      const candidate: PlacedEquipment = {
+        ...item,
+        lat: pointOverride?.lat ?? item.lat,
+        lng: pointOverride?.lng ?? item.lng,
+        rotationDeg: rotationOverride ?? item.rotationDeg,
+      };
+      const candidateRect = getEquipmentClientRect(candidate);
+      if (!candidateRect) return true;
+
+      return placedEquipment.some((otherItem) => {
+        if (ignoredIds.has(otherItem.id)) return false;
+        const otherRect = getEquipmentClientRect(otherItem);
+        return !!otherRect && rectsOverlap(candidateRect, otherRect);
+      });
+    },
+    [getEquipmentClientRect, placedEquipment]
+  );
+
+  const equipmentWouldOverlap = useCallback(
+    (equipment: Equipment, lat: number, lng: number, ignoredIds: Set<string> = new Set()) => {
+      const candidate: PlacedEquipment = {
+        id: "candidate",
+        equipment,
+        lat,
+        lng,
+        rotationDeg: 0,
+      };
+      return itemWouldOverlap(candidate, undefined, undefined, ignoredIds);
+    },
+    [itemWouldOverlap]
+  );
+
+  const canRotateItems = useCallback(
+    (ids: string[]) => {
+      const idSet = new Set(ids);
+      const candidates = placedEquipment
+        .filter((item) => idSet.has(item.id))
+        .map((item) => ({ ...item, rotationDeg: (item.rotationDeg + 2) % 360 }));
+      if (candidates.length !== ids.length) return false;
+
+      const candidateRects = candidates.map((item) => ({ id: item.id, rect: getEquipmentClientRect(item) }));
+      if (candidateRects.some((entry) => !entry.rect)) return false;
+
+      for (let i = 0; i < candidateRects.length; i++) {
+        const rect = candidateRects[i].rect;
+        if (!rect) return false;
+
+        for (let j = i + 1; j < candidateRects.length; j++) {
+          const otherRect = candidateRects[j].rect;
+          if (otherRect && rectsOverlap(rect, otherRect)) return false;
+        }
+
+        const overlapsOutsideSelection = placedEquipment.some((item) => {
+          if (idSet.has(item.id)) return false;
+          const itemRect = getEquipmentClientRect(item);
+          return !!itemRect && rectsOverlap(rect, itemRect);
+        });
+        if (overlapsOutsideSelection) return false;
+      }
+
+      return true;
+    },
+    [getEquipmentClientRect, placedEquipment]
+  );
+
+  const getFixedZoneClientRect = useCallback(() => {
+    const shell = mapShellRef.current;
+    if (!shell) return null;
+
+    const rect = shell.getBoundingClientRect();
+    const left = rect.left + rect.width / 2 - FIXED_ZONE_SIZE_PX / 2;
+    const top = rect.top + rect.height / 2 - FIXED_ZONE_SIZE_PX / 2;
+
+    return {
+      left,
+      right: left + FIXED_ZONE_SIZE_PX,
+      top,
+      bottom: top + FIXED_ZONE_SIZE_PX,
+      width: FIXED_ZONE_SIZE_PX,
+      height: FIXED_ZONE_SIZE_PX,
+    };
+  }, []);
+
+  const clientPointIsInsideFixedZone = useCallback(
+    (clientX: number, clientY: number) => {
+      const rect = getFixedZoneClientRect();
+      if (!rect) return false;
+      return clientX >= rect.left && clientX <= rect.right && clientY >= rect.top && clientY <= rect.bottom;
+    },
+    [getFixedZoneClientRect]
+  );
+
+  const buildSideBySidePositions = useCallback(
+    (groupId: string, equipment: Equipment, startX: number, startY: number, currentX: number, currentY: number) => {
+      const map = mapRef.current;
+      const mapZoom = map?.getZoom();
+      const startPoint = clientPointToLatLng(startX, startY);
+      const zoneRect = getFixedZoneClientRect();
+      if (!map || mapZoom == null || !startPoint || !zoneRect) return [];
+
+      const mpp = metersPerPixel(startPoint.lat, mapZoom);
+      const itemWidthPx = clampVisualSize(equipment.lengthM / mpp);
+      const itemHeightPx = clampVisualSize(equipment.widthM / mpp);
+      const halfWidth = itemWidthPx / 2;
+      const halfHeight = itemHeightPx / 2;
+
+      if (itemWidthPx > zoneRect.width || itemHeightPx > zoneRect.height) return [];
+
+      const deltaX = currentX - startX;
+      const deltaY = currentY - startY;
+      const isHorizontal = Math.abs(deltaX) >= Math.abs(deltaY);
+      const direction = (isHorizontal ? deltaX : deltaY) >= 0 ? 1 : -1;
+      const maxLeft = zoneRect.left + halfWidth;
+      const maxRight = zoneRect.right - halfWidth;
+      const maxTop = zoneRect.top + halfHeight;
+      const maxBottom = zoneRect.bottom - halfHeight;
+      const centerY = Math.max(zoneRect.top + halfHeight, Math.min(zoneRect.bottom - halfHeight, startY));
+      const centerX = Math.max(zoneRect.left + halfWidth, Math.min(zoneRect.right - halfWidth, startX));
+      const startCenterX = centerX;
+      const startCenterY = Math.max(maxTop, Math.min(maxBottom, startY));
+      const stepPx = isHorizontal ? itemWidthPx : itemHeightPx;
+      const draggedDistance = Math.abs((isHorizontal ? currentX : currentY) - (isHorizontal ? startCenterX : startCenterY));
+      const count = Math.max(1, Math.floor(draggedDistance / stepPx) + 1);
+      const positions: { lat: number; lng: number }[] = [];
+      const existingIdsToIgnore = new Set(
+        placedEquipment.filter((item) => item.placementGroupId === groupId).map((item) => item.id)
+      );
+
+      for (let index = 0; index < count; index++) {
+        const nextCenterX = isHorizontal ? startCenterX + direction * index * itemWidthPx : startCenterX;
+        const nextCenterY = isHorizontal ? centerY : startCenterY + direction * index * itemHeightPx;
+        if (nextCenterX < maxLeft || nextCenterX > maxRight || nextCenterY < maxTop || nextCenterY > maxBottom) break;
+        const point = clientPointToLatLng(nextCenterX, nextCenterY);
+        if (!point || !clientPointIsInsideFixedZone(nextCenterX, nextCenterY)) break;
+        if (equipmentWouldOverlap(equipment, point.lat, point.lng, existingIdsToIgnore)) break;
+        positions.push(point);
+      }
+
+      return positions;
+    },
+    [clientPointIsInsideFixedZone, clientPointToLatLng, equipmentWouldOverlap, getFixedZoneClientRect, placedEquipment]
+  );
+
+  // Calculate fixed zone bounds based on screen center
+  const getFixedZoneBounds = useCallback(() => {
+    const map = mapRef.current;
+    const shell = mapShellRef.current;
+    const projection = map?.getProjection();
+    const mapZoom = map?.getZoom();
+    if (!map || !shell || !projection || mapZoom == null) return null;
+
+    const rect = shell.getBoundingClientRect();
+    const screenCenterX = rect.left + rect.width / 2;
+    const screenCenterY = rect.top + rect.height / 2;
+
+    // Calculate the zone size in pixels based on zoom
+    const zoneSize = FIXED_ZONE_SIZE_PX;
+
+    // Get four corners of the zone in screen coordinates
+    const topLeftX = screenCenterX - zoneSize / 2;
+    const topLeftY = screenCenterY - zoneSize / 2;
+    const bottomRightX = screenCenterX + zoneSize / 2;
+    const bottomRightY = screenCenterY + zoneSize / 2;
+
+    // Convert screen coordinates to lat/lng
+    const topLeft = clientPointToLatLng(topLeftX, topLeftY);
+    const bottomRight = clientPointToLatLng(bottomRightX, bottomRightY);
+    const topRight = clientPointToLatLng(bottomRightX, topLeftY);
+    const bottomLeft = clientPointToLatLng(topLeftX, bottomRightY);
+
+    if (!topLeft || !bottomRight || !topRight || !bottomLeft) return null;
+
+    return {
+      north: Math.max(topLeft.lat, topRight.lat),
+      south: Math.min(bottomLeft.lat, bottomRight.lat),
+      east: Math.max(topRight.lng, bottomRight.lng),
+      west: Math.min(topLeft.lng, bottomLeft.lng),
+    };
+  }, [clientPointToLatLng]);
+
+  useEffect(() => {
+    if (!mapLoaded || !mapRef.current) return;
+    const map = mapRef.current;
+
+    const emitView = () => {
+      const center = map.getCenter();
+      if (!center) return;
+      onMapViewChange({
+        center: { lat: center.lat(), lng: center.lng() },
+        zoom: map.getZoom() ?? 13,
+      });
+      setZoom(map.getZoom() ?? 13);
+      // Update fixed zone bounds whenever map view changes
+      const bounds = getFixedZoneBounds();
+      setFixedZoneBounds(bounds);
+    };
+
+    const idleListener = map.addListener("idle", emitView);
+    const zoomListener = map.addListener("zoom_changed", emitView);
+    emitView();
+
+    return () => {
+      idleListener.remove();
+      zoomListener.remove();
+    };
+  }, [mapLoaded, onMapViewChange, getFixedZoneBounds]);
+
+  // Setup Drawing Manager for area tool
+  useEffect(() => {
+    if (!mapLoaded || !mapRef.current) return;
+    const maps = window.google.maps;
+
+    if (!drawingManagerRef.current) {
+      const dm = new maps.drawing.DrawingManager({
+        drawingMode: null,
+        drawingControl: false,
+        rectangleOptions: {
+          fillColor: "#f59e0b",
+          fillOpacity: 0.15,
+          strokeColor: "#f59e0b",
+          strokeWeight: 2,
+          strokeOpacity: 0.9,
+          editable: true,
+          draggable: true,
+        },
+      });
+      dm.setMap(mapRef.current);
+      drawingManagerRef.current = dm;
+
+      maps.event.addListener(dm, "rectanglecomplete", (rect: google.maps.Rectangle) => {
+        const bounds = rect.getBounds();
+        if (!bounds) return;
+        const ne = bounds.getNorthEast();
+        const sw = bounds.getSouthWest();
+        const { areaM2, widthM, heightM } = boundsToAreaMeters(
+          { lat: ne.lat(), lng: ne.lng() },
+          { lat: sw.lat(), lng: sw.lng() }
+        );
+        emitAreaSelected({
+          source: "drawn",
+          type: "rectangle",
+          areaM2,
+          widthM: Math.max(widthM, heightM),
+          heightM: Math.min(widthM, heightM),
+          label: `${Math.max(widthM, heightM).toFixed(1)}m x ${Math.min(widthM, heightM).toFixed(1)}m`,
+          bounds: {
+            north: ne.lat(),
+            south: sw.lat(),
+            east: ne.lng(),
+            west: sw.lng(),
+          },
+          center: {
+            lat: bounds.getCenter().lat(),
+            lng: bounds.getCenter().lng(),
+          },
+        });
+        dm.setDrawingMode(null);
+        onToolChange("pan");
+      });
+    }
+  }, [emitAreaSelected, mapLoaded, onToolChange]);
+
+  // Sync drawing mode with active tool
+  useEffect(() => {
+    if (!drawingManagerRef.current) return;
+    const maps = window.google?.maps;
+    if (!maps) return;
+    if (activeTool === "area") {
+      drawingManagerRef.current.setDrawingMode(maps.drawing.OverlayType.RECTANGLE);
+    } else {
+      drawingManagerRef.current.setDrawingMode(null);
+    }
+  }, [activeTool]);
+
+  useEffect(() => {
+    if (!isMeasureComplete || measurePoints.length < 3) return;
+    const areaM2 = polygonArea(measurePoints);
+    const bounds = polygonBounds(measurePoints);
+    const { widthM, heightM } = boundsDimensionsMeters(bounds);
+    emitAreaSelected({
+      source: "measurement",
+      type: "polygon",
+      areaM2,
+      widthM,
+      heightM,
+      label: `${widthM.toFixed(1)}m x ${heightM.toFixed(1)}m`,
+      path: measurePoints,
+      bounds,
+      center: polygonCenter(measurePoints),
+    });
+  }, [emitAreaSelected, isMeasureComplete, measurePoints]);
+
+  const pointIsInsideAnyArea = useCallback(
+    (point: { lat: number; lng: number }) => {
+      // Check fixed zone first
+      if (fixedZoneBounds) {
+        const isInFixedZone =
+          point.lat <= fixedZoneBounds.north &&
+          point.lat >= fixedZoneBounds.south &&
+          point.lng <= fixedZoneBounds.east &&
+          point.lng >= fixedZoneBounds.west;
+        if (isInFixedZone) return true;
+      }
+
+      // Check drawn and selected areas
+      const candidates = [
+        ...areas,
+        ...(selectedArea ? [selectedArea] : []),
+      ];
+
+      return candidates.some((area) => {
+        if (area.type === "polygon" && area.path) {
+          return isPointInPolygon(point, area.path);
+        }
+        if (area.bounds) {
+          return (
+            point.lat <= area.bounds.north &&
+            point.lat >= area.bounds.south &&
+            point.lng <= area.bounds.east &&
+            point.lng >= area.bounds.west
+          );
+        }
+        return false;
+      });
+    },
+    [areas, selectedArea, fixedZoneBounds]
+  );
+
+  const buildDraggedCopyPositions = useCallback(
+    (groupId: string, sourceItem: PlacedEquipment, startX: number, startY: number, currentX: number, currentY: number) => {
+      const map = mapRef.current;
+      const mapZoom = map?.getZoom();
+      const sourceCenter = latLngToClientPoint(sourceItem.lat, sourceItem.lng);
+      const shellRect = mapShellRef.current?.getBoundingClientRect();
+      if (!map || mapZoom == null || !sourceCenter || !shellRect) return [];
+
+      const mpp = metersPerPixel(sourceItem.lat, mapZoom);
+      const itemWidthPx = clampVisualSize(sourceItem.equipment.lengthM / mpp);
+      const itemHeightPx = clampVisualSize(sourceItem.equipment.widthM / mpp);
+      const deltaX = currentX - startX;
+      const deltaY = currentY - startY;
+      const isHorizontal = Math.abs(deltaX) >= Math.abs(deltaY);
+      const direction = (isHorizontal ? deltaX : deltaY) >= 0 ? 1 : -1;
+      const stepPx = isHorizontal ? itemWidthPx : itemHeightPx;
+      const draggedDistance = Math.abs(isHorizontal ? deltaX : deltaY);
+      const count = Math.floor(draggedDistance / stepPx);
+      const positions: { lat: number; lng: number; rotationDeg?: number }[] = [];
+      const existingIdsToIgnore = new Set(
+        placedEquipment.filter((item) => item.placementGroupId === groupId).map((item) => item.id)
+      );
+
+      for (let index = 1; index <= count; index++) {
+        const nextCenterX = isHorizontal ? sourceCenter.x + direction * index * itemWidthPx : sourceCenter.x;
+        const nextCenterY = isHorizontal ? sourceCenter.y : sourceCenter.y + direction * index * itemHeightPx;
+        if (
+          nextCenterX < shellRect.left ||
+          nextCenterX > shellRect.right ||
+          nextCenterY < shellRect.top ||
+          nextCenterY > shellRect.bottom
+        ) {
+          break;
+        }
+
+        const point = clientPointToLatLng(nextCenterX, nextCenterY);
+        if (!point || !pointIsInsideAnyArea(point)) break;
+
+        const candidate: PlacedEquipment = {
+          ...sourceItem,
+          id: "copy-candidate",
+          lat: point.lat,
+          lng: point.lng,
+        };
+        if (itemWouldOverlap(candidate, undefined, sourceItem.rotationDeg, existingIdsToIgnore)) break;
+        positions.push({ ...point, rotationDeg: sourceItem.rotationDeg });
+      }
+
+      return positions;
+    },
+    [clientPointToLatLng, itemWouldOverlap, latLngToClientPoint, placedEquipment, pointIsInsideAnyArea]
   );
 
   useEffect(() => {
     if (!pendingEquipmentDrop) return;
-    const point = clientPointToLatLng(pendingEquipmentDrop.clientX, pendingEquipmentDrop.clientY);
-    if (point && pointIsInsideSelectedArea(point)) {
-      onPlaceEquipment(pendingEquipmentDrop.equipment, point.lat, point.lng);
-    }
-    onPendingEquipmentDropHandled();
+    let cancelled = false;
+    let retryFrame: number | null = null;
+
+    const tryPlace = (attempt: number) => {
+      if (cancelled) return;
+      const point = clientPointToLatLng(pendingEquipmentDrop.clientX, pendingEquipmentDrop.clientY);
+      if (point && pointIsInsideAnyArea(point)) {
+        onPlaceEquipment(pendingEquipmentDrop.equipment, point.lat, point.lng);
+        onPendingEquipmentDropHandled();
+        return;
+      }
+
+      if (attempt === 0) {
+        retryFrame = window.requestAnimationFrame(() => tryPlace(1));
+        return;
+      }
+
+      onPendingEquipmentDropHandled();
+    };
+
+    tryPlace(0);
+
+    return () => {
+      cancelled = true;
+      if (retryFrame != null) window.cancelAnimationFrame(retryFrame);
+    };
   }, [
     clientPointToLatLng,
     onPendingEquipmentDropHandled,
     onPlaceEquipment,
     pendingEquipmentDrop,
-    pointIsInsideSelectedArea,
+    pointIsInsideAnyArea,
   ]);
 
   useEffect(() => {
@@ -437,7 +705,14 @@ export default function MapContainer({
 
     const handlePointerMove = (event: PointerEvent) => {
       const point = clientPointToLatLng(event.clientX, event.clientY);
-      if (point && pointIsInsideSelectedArea(point)) {
+      const draggedItem = placedEquipment.find((item) => item.id === draggingPlacedId);
+      const ignoredIds = new Set([draggingPlacedId]);
+      if (
+        point &&
+        draggedItem &&
+        pointIsInsideAnyArea(point) &&
+        !itemWouldOverlap(draggedItem, point, undefined, ignoredIds)
+      ) {
         onMoveEquipment(draggingPlacedId, point.lat, point.lng);
       }
     };
@@ -449,14 +724,14 @@ export default function MapContainer({
       window.removeEventListener("pointermove", handlePointerMove);
       window.removeEventListener("pointerup", handlePointerUp);
     };
-  }, [clientPointToLatLng, draggingPlacedId, onMoveEquipment, pointIsInsideSelectedArea]);
+  }, [clientPointToLatLng, draggingPlacedId, itemWouldOverlap, onMoveEquipment, placedEquipment, pointIsInsideAnyArea]);
 
   useEffect(() => {
     const handleOutsidePointerDown = (event: PointerEvent) => {
       const target = event.target;
       if (!(target instanceof Element)) return;
-      if (!target.closest("[data-equipment-overlay]")) {
-        setSelectedPlacedId(null);
+      if (!target.closest("[data-equipment-overlay]") && !target.closest("[data-equipment-selection-toolbar]")) {
+        setSelectedPlacedIds([]);
       }
     };
 
@@ -466,12 +741,161 @@ export default function MapContainer({
 
   const handleMapClick = useCallback(
     (e: google.maps.MapMouseEvent) => {
-      setSelectedPlacedId(null);
+      if (suppressNextMapClickRef.current) {
+        suppressNextMapClickRef.current = false;
+        return;
+      }
+      setSelectedPlacedIds([]);
       if (activeTool !== "measure" || !e.latLng) return;
       onMapClick(e.latLng.lat(), e.latLng.lng());
     },
     [activeTool, onMapClick]
   );
+
+  const handleMapPointerDown = useCallback(
+    (event: React.PointerEvent<HTMLDivElement>) => {
+      if (event.button !== 0) return;
+      const target = event.target;
+      if (target instanceof Element && target.closest("[data-equipment-selection-toolbar]")) return;
+
+      if (event.ctrlKey && activeTool !== "measure" && activeTool !== "area") {
+        const equipmentOverlay = target instanceof Element ? target.closest("[data-equipment-overlay]") : null;
+        const sourceId = equipmentOverlay?.getAttribute("data-equipment-id");
+        const sourceItem = sourceId ? placedEquipment.find((item) => item.id === sourceId) : null;
+
+        if (sourceItem) {
+          event.preventDefault();
+          event.stopPropagation();
+          suppressNextMapClickRef.current = true;
+
+          const groupId = `copy-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
+          const startX = event.clientX;
+          const startY = event.clientY;
+          setAutoPlacingGroupId(groupId);
+          setSelectedPlacedIds([sourceItem.id]);
+
+          const handlePointerMove = (moveEvent: PointerEvent) => {
+            onPlaceEquipmentGroup(
+              groupId,
+              sourceItem.equipment,
+              buildDraggedCopyPositions(groupId, sourceItem, startX, startY, moveEvent.clientX, moveEvent.clientY)
+            );
+          };
+
+          const handlePointerUp = () => {
+            suppressNextMapClickRef.current = true;
+            setAutoPlacingGroupId(null);
+            window.removeEventListener("pointermove", handlePointerMove);
+          };
+
+          window.addEventListener("pointermove", handlePointerMove);
+          window.addEventListener("pointerup", handlePointerUp, { once: true });
+          return;
+        }
+
+        event.preventDefault();
+        event.stopPropagation();
+        suppressNextMapClickRef.current = true;
+
+        const startX = event.clientX;
+        const startY = event.clientY;
+        setSelectionDrag({ startX, startY, currentX: startX, currentY: startY });
+
+        const selectInRect = (rect: ClientRect) => {
+          const nextIds = placedEquipment
+            .filter((item) => {
+              const itemRect = getEquipmentClientRect(item);
+              return !!itemRect && rectsOverlap(rect, itemRect);
+            })
+            .map((item) => item.id);
+          setSelectedPlacedIds(nextIds);
+        };
+
+        selectInRect(normalizeClientRect(startX, startY, startX, startY));
+
+        const handlePointerMove = (moveEvent: PointerEvent) => {
+          const nextRect = normalizeClientRect(startX, startY, moveEvent.clientX, moveEvent.clientY);
+          setSelectionDrag({ startX, startY, currentX: moveEvent.clientX, currentY: moveEvent.clientY });
+          selectInRect(nextRect);
+        };
+
+        const handlePointerUp = () => {
+          suppressNextMapClickRef.current = true;
+          setSelectionDrag(null);
+          window.removeEventListener("pointermove", handlePointerMove);
+        };
+
+        window.addEventListener("pointermove", handlePointerMove);
+        window.addEventListener("pointerup", handlePointerUp, { once: true });
+        return;
+      }
+
+      if (!selectedEquipment || activeTool === "measure" || activeTool === "area") return;
+      if (target instanceof Element && target.closest("[data-equipment-overlay]")) return;
+      if (!clientPointIsInsideFixedZone(event.clientX, event.clientY)) return;
+
+      event.preventDefault();
+      event.stopPropagation();
+      suppressNextMapClickRef.current = true;
+      setSelectedPlacedIds([]);
+
+      const groupId = `auto-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
+      const startX = event.clientX;
+      const startY = event.clientY;
+      setAutoPlacingGroupId(groupId);
+      onPlaceEquipmentGroup(groupId, selectedEquipment, buildSideBySidePositions(groupId, selectedEquipment, startX, startY, startX, startY));
+
+      const handlePointerMove = (moveEvent: PointerEvent) => {
+        onPlaceEquipmentGroup(
+          groupId,
+          selectedEquipment,
+          buildSideBySidePositions(groupId, selectedEquipment, startX, startY, moveEvent.clientX, moveEvent.clientY)
+        );
+      };
+
+      const handlePointerUp = () => {
+        suppressNextMapClickRef.current = true;
+        setAutoPlacingGroupId(null);
+        window.removeEventListener("pointermove", handlePointerMove);
+      };
+
+      window.addEventListener("pointermove", handlePointerMove);
+      window.addEventListener("pointerup", handlePointerUp, { once: true });
+    },
+    [activeTool, buildDraggedCopyPositions, buildSideBySidePositions, clientPointIsInsideFixedZone, getEquipmentClientRect, onPlaceEquipmentGroup, placedEquipment, selectedEquipment]
+  );
+
+  const selectedEquipmentItems = placedEquipment.filter((item) => selectedPlacedIds.includes(item.id));
+  const multiSelectionToolbar = useMemo(() => {
+    if (selectedEquipmentItems.length < 2) return null;
+    const shell = mapShellRef.current;
+    if (!shell) return null;
+
+    const itemRects = selectedEquipmentItems
+      .map((item) => getEquipmentClientRect(item))
+      .filter((rect): rect is ClientRect => !!rect);
+    if (itemRects.length === 0) return null;
+
+    const shellRect = shell.getBoundingClientRect();
+    const union = itemRects.reduce(
+      (acc, rect) => ({
+        left: Math.min(acc.left, rect.left),
+        right: Math.max(acc.right, rect.right),
+        top: Math.min(acc.top, rect.top),
+        bottom: Math.max(acc.bottom, rect.bottom),
+      }),
+      itemRects[0]
+    );
+
+    return {
+      left: (union.left + union.right) / 2 - shellRect.left,
+      top: union.top - shellRect.top,
+    };
+  }, [getEquipmentClientRect, selectedEquipmentItems]);
+  const selectionDragRect = selectionDrag
+    ? normalizeClientRect(selectionDrag.startX, selectionDrag.startY, selectionDrag.currentX, selectionDrag.currentY)
+    : null;
+  const shellRect = mapShellRef.current?.getBoundingClientRect();
 
   if (loadError) {
     return (
@@ -504,9 +928,14 @@ export default function MapContainer({
   const polylinePath = measurePoints.map((p) => ({ lat: p.lat, lng: p.lng }));
 
   return (
-    <div ref={mapShellRef} className="flex-1 relative overflow-hidden" style={{
-      cursor: activeTool === "measure" ? "crosshair" : activeTool === "area" ? "crosshair" : "grab",
-    }}>
+    <div
+      ref={mapShellRef}
+      className="flex-1 relative overflow-hidden"
+      onPointerDownCapture={handleMapPointerDown}
+      style={{
+        cursor: activeTool === "measure" ? "crosshair" : activeTool === "area" ? "crosshair" : selectedEquipment ? "copy" : "grab",
+      }}
+    >
       {/* <LocationSearch mapRef={mapRef} onLocationFound={(lat, lng, name) => {
         setSelectedLocation({ lat, lng, name });
       }} /> */}
@@ -629,39 +1058,33 @@ export default function MapContainer({
           );
         })()}
 
-        {/* Area label */}
-        {selectedArea && (() => {
-          const rectBounds = rectangleRef.current?.getBounds();
-          const center =
-            selectedArea.center ??
-            (rectBounds
-              ? { lat: rectBounds.getCenter().lat(), lng: rectBounds.getCenter().lng() }
-              : null);
-          if (!center) return null;
+        {/* Drawn areas */}
+        {areas.map((area) => {
+          if (!area.bounds) return null;
+          const isSelected = selectedArea?.id && area.id ? selectedArea.id === area.id : sameArea(selectedArea, area);
           return (
-            <OverlayView
-              position={center}
-              mapPaneName={OverlayView.OVERLAY_LAYER}
-            >
-              <div></div>
-              {/* <div className="transform -translate-x-1/2 -translate-y-1/2 w-fit bg-[rgba(10,14,26,0.95)] border border-[var(--accent-amber)] rounded-lg px-4 py-3 pointer-events-none shadow-xl text-center">
-                <p className="text-[var(--accent-amber)] font-mono text-sm font-bold">
-                  {formatArea(selectedArea.areaM2)}
-                </p>
-                <p className="text-[var(--muted)] font-mono text-[10px] mt-1">
-                  {selectedArea.widthM.toFixed(1)}m x {selectedArea.heightM.toFixed(1)}m
-                </p>
-              </div> */}
-            </OverlayView>
+            <Rectangle
+              key={area.id ?? `${area.label}-${area.areaM2}`}
+              bounds={area.bounds}
+              options={{
+                fillColor: isSelected ? "#f59e0b" : "#e3e3e3",
+                fillOpacity: 0.12,
+                strokeColor: isSelected ? "#f59e0b" : "#e3e3e3",
+                strokeWeight: isSelected ? 2 : 1,
+                strokeOpacity: 0.9,
+              }}
+              onClick={() => onAreaSelected(area)}
+            />
           );
-        })()}
+        })}
 
         {/* Placed equipment */}
         {placedEquipment.map((item) => {
           const mpp = metersPerPixel(item.lat, zoom);
           const widthPx = clampVisualSize(item.equipment.lengthM / mpp);
           const heightPx = clampVisualSize(item.equipment.widthM / mpp);
-          const isSelected = selectedPlacedId === item.id;
+          const isSelected = selectedPlacedIds.includes(item.id);
+          const hasMultiSelection = selectedPlacedIds.length > 1;
           return (
             <OverlayView
               key={item.id}
@@ -670,13 +1093,14 @@ export default function MapContainer({
             >
               <div
                 data-equipment-overlay
+                data-equipment-id={item.id}
                 className="absolute select-none"
                 style={{
                   width: widthPx,
                   height: heightPx,
                   transform: "translate(-50%, -50%)",
                   transformOrigin: "center",
-                  zIndex: draggingPlacedId === item.id || isSelected ? 50 : 20,
+                  zIndex: draggingPlacedId === item.id || isSelected || item.placementGroupId === autoPlacingGroupId ? 50 : 20,
                 }}
               >
                 <div
@@ -690,9 +1114,10 @@ export default function MapContainer({
                     transformOrigin: "center",
                   }}
                   onPointerDown={(event) => {
+                    if (event.ctrlKey) return;
                     event.preventDefault();
                     event.stopPropagation();
-                    setSelectedPlacedId(item.id);
+                    setSelectedPlacedIds([item.id]);
                     setDraggingPlacedId(item.id);
                   }}
                   title={`${item.equipment.name} (${item.equipment.lengthM}m x ${item.equipment.widthM}m)`}
@@ -715,7 +1140,7 @@ export default function MapContainer({
                     </div>
                   )}
                 </div>
-                {isSelected && (
+                {isSelected && !hasMultiSelection && (
                   <>
                   <div className="absolute left-1/2 top-full mt-1 -translate-x-1/2 whitespace-nowrap rounded bg-[rgba(10,14,26,0.92)] border border-white/40 px-2 py-0.5 text-[10px] font-mono font-semibold text-white shadow-lg pointer-events-none">
                     {item.equipment.lengthM}m x {item.equipment.widthM}m
@@ -727,21 +1152,12 @@ export default function MapContainer({
                       onPointerDown={(event) => event.stopPropagation()}
                       onClick={(event) => {
                         event.stopPropagation();
-                        onRotateEquipment(item.id);
+                        if (canRotateItems([item.id])) {
+                          onRotateEquipment(item.id);
+                        }
                       }}
                     >
                       <RotateCw size={13} />
-                    </button>
-                    <button
-                      className="tooltip grid h-6 w-6 place-items-center rounded text-[var(--muted)] hover:bg-[var(--surface-3)] hover:text-[var(--accent-cyan)]"
-                      data-tip="Duplicate"
-                      onPointerDown={(event) => event.stopPropagation()}
-                      onClick={(event) => {
-                        event.stopPropagation();
-                        onDuplicateEquipment(item.id);
-                      }}
-                    >
-                      <CopyPlus size={13} />
                     </button>
                     <button
                       className="tooltip grid h-6 w-6 place-items-center rounded text-[var(--muted)] hover:bg-[var(--surface-3)] hover:text-[var(--accent-red)]"
@@ -790,6 +1206,42 @@ export default function MapContainer({
         )}
       </GoogleMap>
 
+      {selectionDragRect && shellRect && (
+        <div
+          className="absolute border border-[var(--accent-cyan)] bg-[rgba(6,182,212,0.12)] pointer-events-none"
+          style={{
+            left: selectionDragRect.left - shellRect.left,
+            top: selectionDragRect.top - shellRect.top,
+            width: selectionDragRect.right - selectionDragRect.left,
+            height: selectionDragRect.bottom - selectionDragRect.top,
+          }}
+        />
+      )}
+
+      {multiSelectionToolbar && (
+        <div
+          data-equipment-selection-toolbar
+          className="absolute z-[70] flex -translate-x-1/2 -translate-y-full items-center gap-1 rounded-md border border-[var(--border)] bg-[rgba(10,14,26,0.94)] px-1 py-0.5 shadow-xl"
+          style={{ left: multiSelectionToolbar.left, top: multiSelectionToolbar.top - 8 }}
+        >
+          <span className="px-2 text-[10px] font-mono font-semibold text-white">
+            {selectedPlacedIds.length} selected
+          </span> 
+          <button
+            className="tooltip grid h-6 w-6 place-items-center rounded text-[var(--muted)] hover:bg-[var(--surface-3)] hover:text-[var(--accent-red)]"
+            data-tip="Delete selected"
+            onPointerDown={(event) => event.stopPropagation()}
+            onClick={(event) => {
+              event.stopPropagation();
+              selectedPlacedIds.forEach((id) => onDeleteEquipment(id));
+              setSelectedPlacedIds([]);
+            }}
+          >
+            <Trash2 size={13} />
+          </button>
+        </div>
+      )}
+
       {/* Instructions & quick actions overlay */}
       {activeTool === "measure" && measurePoints.length === 0 && (
         <div className="absolute bottom-6 left-1/2 -translate-x-1/2 bg-[rgba(10,14,26,0.9)] border border-[var(--accent-amber)] rounded-xl px-4 py-2 text-sm text-[var(--accent-amber)] font-mono pointer-events-none animate-fade-in shadow-lg">
@@ -809,6 +1261,23 @@ export default function MapContainer({
           Click and drag to draw an area rectangle
         </div>
       )}
+      {selectedEquipment && activeTool !== "measure" && activeTool !== "area" && (
+        <div className="absolute bottom-6 left-1/2 -translate-x-1/2 bg-[rgba(10,14,26,0.9)] border border-[var(--accent-cyan)] rounded-xl px-4 py-2 text-sm text-[var(--accent-cyan)] font-mono pointer-events-none animate-fade-in shadow-lg">
+          Drag inside the square to place {selectedEquipment.name} side by side
+        </div>
+      )}
+
+      {/* Fixed square zone overlay */}
+      <div
+        className="absolute left-1/2 top-1/2 -translate-x-1/2 -translate-y-1/2 pointer-events-none"
+        style={{
+          width: FIXED_ZONE_SIZE_PX,
+          height: FIXED_ZONE_SIZE_PX,
+          border: "2px dashed rgba(255, 255, 255)",
+          borderRadius: "2px", 
+          backgroundColor: "rgba(255, 255, 255, 0.09)",
+        }}
+      />
     </div>
   );
 }

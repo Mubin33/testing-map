@@ -25,6 +25,9 @@ export interface MeasureSegment {
 
 // ─── Area ──────────────────────────────────────────────────────────────────
 export interface SelectedArea {
+  id?: string;
+  name?: string;
+  source?: "drawn" | "measurement";
   type: "rectangle" | "polygon" | "manual";
   areaM2: number;
   widthM: number;   // longer side
@@ -61,6 +64,7 @@ export interface PlacedEquipment {
   lat: number;
   lng: number;
   rotationDeg: number;
+  placementGroupId?: string;
 }
 
 export interface EquipmentDropRequest {

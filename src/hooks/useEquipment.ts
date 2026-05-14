@@ -18,7 +18,9 @@ export function useEquipment() {
   const [equipment, setEquipment] = useState<Equipment[]>(PRESETS);
   const [selected, setSelected] = useState<Equipment | null>(null);
 
-  const select = useCallback((eq: Equipment) => setSelected(eq), []);
+  const select = useCallback((eq: Equipment) => {
+    setSelected((prev) => (prev?.id === eq.id ? null : eq));
+  }, []);
   const deselect = useCallback(() => setSelected(null), []);
 
   const addCustom = useCallback(

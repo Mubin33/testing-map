@@ -1,6 +1,4 @@
 "use client";
-import { useDraggable } from "@dnd-kit/core";
-import { CSS } from "@dnd-kit/utilities";
 import type { Equipment } from "@/types";
 
 interface Props {
@@ -11,23 +9,10 @@ interface Props {
 }
 
 export default function EquipmentCard({ equipment, isSelected, onSelect, onRemove }: Props) {
-  const { attributes, listeners, setNodeRef, transform, isDragging } = useDraggable({
-    id: equipment.id,
-    data: { equipment },
-  });
-
-  const style = {
-    transform: CSS.Translate.toString(transform),
-    opacity: isDragging ? 0.5 : 1,
-    zIndex: isDragging ? 50 : "auto",
-  };
-
   return (
     <div
-      ref={setNodeRef}
-      style={style}
       className={`
-        relative group flex items-center gap-3 px-3 py-2.5 rounded-lg border cursor-grab active:cursor-grabbing
+        relative group flex items-center gap-3 px-3 py-2.5 rounded-lg border cursor-pointer
         transition-all duration-150 select-none
         ${isSelected
           ? "border-[var(--accent-cyan)] bg-[rgba(6,182,212,0.08)] glow-cyan"
@@ -35,8 +20,6 @@ export default function EquipmentCard({ equipment, isSelected, onSelect, onRemov
         }
       `}
       onClick={() => onSelect(equipment)}
-      {...attributes}
-      {...listeners}
     >
       {/* Color strip */}
       <div

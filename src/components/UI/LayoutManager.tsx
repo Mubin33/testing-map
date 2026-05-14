@@ -46,7 +46,7 @@ export default function LayoutManager({ layouts, selectedLayoutId, onSelectLayou
         type="button"
         onClick={onLoad}
         disabled={!selectedLayoutId}
-        className="inline-flex items-center gap-1 rounded-md border border-[var(--border)] px-2.5 py-1 text-xs text-[var(--muted)] transition-colors hover:border-[var(--accent-cyan)] hover:text-[var(--text)] disabled:cursor-not-allowed disabled:opacity-40"
+        className="inline-flex items-center gap-1 rounded-md border hover:border-[var(--border)] px-2.5 py-1 text-xs hover:text-[var(--muted)] transition-colors border-[var(--accent-cyan)] text-[var(--text)] disabled:cursor-not-allowed disabled:opacity-40"
       >
         <Download size={12} />
         Load
@@ -63,7 +63,7 @@ export default function LayoutManager({ layouts, selectedLayoutId, onSelectLayou
         type="button"
         onClick={onDelete}
         disabled={!selectedLayoutId}
-        className="inline-flex items-center gap-1 rounded-md border border-[var(--border)] px-2.5 py-1 text-xs text-[var(--muted)] transition-colors hover:border-[var(--accent-red)] hover:text-[var(--accent-red)] disabled:cursor-not-allowed disabled:opacity-40"
+        className="inline-flex items-center gap-1 rounded-md border hover:border-[var(--border)] px-2.5 py-1 text-xs hover:text-[var(--muted)] transition-colors border-[var(--accent-red)] text-[var(--accent-red)] disabled:cursor-not-allowed disabled:opacity-40"
       >
         <Trash2 size={12} />
         Delete

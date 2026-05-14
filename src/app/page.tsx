@@ -33,10 +33,25 @@ import {
   type SavedLayoutState,
 } from "@/utils/layoutStorage";
 import MapContainerLeaflet from "@/components/Map/MapContainerLeaflet";
+import { isPointInPolygon } from "@/utils/geoUtils";
+
+function pointInsideArea(point: { lat: number; lng: number }, area: SelectedArea) {
+  if (area.type === "polygon" && area.path) {
+    return isPointInPolygon(point, area.path);
+  }
+  if (!area.bounds) return false;
+  return (
+    point.lat <= area.bounds.north &&
+    point.lat >= area.bounds.south &&
+    point.lng <= area.bounds.east &&
+    point.lng >= area.bounds.west
+  );
+}
 
 export default function Home() {
   const [activeTool, setActiveTool] = useState<ActiveTool>("pan");
   const [selectedArea, setSelectedArea] = useState<SelectedArea | null>(null);
+  const [areas, setAreas] = useState<SelectedArea[]>([]);
   const [draggingEquipment, setDraggingEquipment] = useState<Equipment | null>(null);
   const [pendingEquipmentDrop, setPendingEquipmentDrop] = useState<EquipmentDropRequest | null>(null);
   const [placedEquipment, setPlacedEquipment] = useState<PlacedEquipment[]>([]);
@@ -68,7 +83,8 @@ export default function Home() {
     setMapView(layout.mapView ?? DEFAULT_MAP_VIEW);
     setUnitSystem(layout.unitSystem);
     hydrateMeasure(layout.measurePoints, layout.measureComplete);
-    setSelectedArea(layout.selectedArea);
+    setAreas(layout.areas ?? (layout.selectedArea?.source === "drawn" ? [layout.selectedArea] : []));
+    setSelectedArea(layout.selectedArea ?? layout.areas?.[0] ?? null);
     setPlacedEquipment(layout.placedEquipment);
     hydrateEquipment(layout.equipmentCatalog, layout.selectedEquipmentId);
   }, [hydrateEquipment, hydrateMeasure]);
@@ -98,39 +114,47 @@ export default function Home() {
   }, []);
 
   const handleAreaSelected = useCallback((nextArea: SelectedArea) => {
-    setSelectedArea((prev) => {
-      if (!prev) return nextArea;
-      if (prev.type !== nextArea.type) return nextArea;
-      if (
-        prev.areaM2 === nextArea.areaM2 &&
-        prev.widthM === nextArea.widthM &&
-        prev.heightM === nextArea.heightM &&
-        prev.label === nextArea.label &&
-        prev.center?.lat === nextArea.center?.lat &&
-        prev.center?.lng === nextArea.center?.lng
-      ) {
-        const prevBounds = prev.bounds;
-        const nextBounds = nextArea.bounds;
-        const boundsMatch =
-          !!prevBounds &&
-          !!nextBounds &&
-          prevBounds.north === nextBounds.north &&
-          prevBounds.south === nextBounds.south &&
-          prevBounds.east === nextBounds.east &&
-          prevBounds.west === nextBounds.west;
-        const pathMatch =
-          prev.path?.length === nextArea.path?.length &&
-          prev.path?.every((point, index) => {
-            const nextPoint = nextArea.path?.[index];
-            return !!nextPoint && point.id === nextPoint.id && point.lat === nextPoint.lat && point.lng === nextPoint.lng;
-          });
-        if (boundsMatch && pathMatch) {
-          return prev;
-        }
+    // For measurement polygons, just select them
+    if (nextArea.source === "measurement") {
+      setSelectedArea(nextArea);
+      return;
+    }
+
+    // For drawn rectangles, add/update in areas array
+    const areaId = nextArea.id ?? `area-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
+    const areaName = nextArea.name ?? `Shape ${areas.filter(a => a.source === "drawn").length + 1}`;
+    const areaWithId: SelectedArea = { ...nextArea, id: areaId, name: areaName, source: "drawn" };
+
+    setAreas((prev) => {
+      const existingIndex = prev.findIndex((area) => area.id === areaId);
+      if (existingIndex >= 0) {
+        const updated = [...prev];
+        updated[existingIndex] = areaWithId;
+        return updated;
       }
-      return nextArea;
+      return [...prev, areaWithId];
     });
+    setSelectedArea(areaWithId);
+  }, [areas]);
+
+  const updateArea = useCallback((updatedArea: SelectedArea) => {
+    setAreas((prev) => prev.map((area) => (area.id === updatedArea.id ? updatedArea : area)));
+    setSelectedArea((prev) => (prev?.id === updatedArea.id ? updatedArea : prev));
   }, []);
+
+  const renameArea = useCallback((areaId: string, name: string) => {
+    setAreas((prev) => prev.map((area) => (area.id === areaId ? { ...area, name } : area)));
+    setSelectedArea((prev) => (prev?.id === areaId ? { ...prev, name } : prev));
+  }, []);
+
+  const deleteArea = useCallback((areaId: string) => {
+    const target = areas.find((area) => area.id === areaId);
+    if (!target) return;
+
+    setPlacedEquipment((prev) => prev.filter((item) => !pointInsideArea({ lat: item.lat, lng: item.lng }, target)));
+    setAreas((prev) => prev.filter((area) => area.id !== areaId));
+    setSelectedArea((prev) => (prev?.id === areaId ? null : prev));
+  }, [areas]);
 
   const handleDragStart = (event: DragStartEvent) => {
     const equipment = event.active.data.current?.equipment as Equipment | undefined;
@@ -165,26 +189,36 @@ export default function Home() {
   };
 
   const handleClearArea = useCallback(() => {
+    setAreas([]);
     setSelectedArea(null);
   }, []);
 
   const handleMeasureMapClick = useCallback(
     (lat: number, lng: number) => {
-      if (isComplete) setSelectedArea(null);
+      // Clear measurement selectedArea before adding new point
+      if (selectedArea?.source === "measurement") {
+        setSelectedArea(null);
+      }
       addPoint(lat, lng);
     },
-    [addPoint, isComplete]
+    [addPoint, selectedArea]
   );
 
   const handleClearMeasure = useCallback(() => {
     clearPoints();
-    if (selectedArea?.type === "polygon") setSelectedArea(null);
-  }, [clearPoints, selectedArea?.type]);
+    // Always clear measurement-based selectedArea when clearing measure points
+    if (selectedArea?.source === "measurement" || selectedArea?.type === "polygon") {
+      setSelectedArea(null);
+    }
+  }, [clearPoints, selectedArea]);
 
   const handleUndoMeasurePoint = useCallback(() => {
     removeLastPoint();
-    if (selectedArea?.type === "polygon") setSelectedArea(null);
-  }, [removeLastPoint, selectedArea?.type]);
+    // Clear selectedArea if it's measurement-based since we're modifying the measurement
+    if (selectedArea?.source === "measurement" || selectedArea?.type === "polygon") {
+      setSelectedArea(null);
+    }
+  }, [removeLastPoint, selectedArea]);
 
   // Keyboard shortcuts
   useEffect(() => {
@@ -210,6 +244,20 @@ export default function Home() {
         lng,
         rotationDeg: 0,
       },
+    ]);
+  }, []);
+
+  const placeEquipmentGroup = useCallback((groupId: string, equipment: Equipment, positions: { lat: number; lng: number; rotationDeg?: number }[]) => {
+    setPlacedEquipment((prev) => [
+      ...prev.filter((item) => item.placementGroupId !== groupId),
+      ...positions.map((position, index) => ({
+        id: `${groupId}-${index}`,
+        equipment,
+        lat: position.lat,
+        lng: position.lng,
+        rotationDeg: position.rotationDeg ?? 0,
+        placementGroupId: groupId,
+      })),
     ]);
   }, []);
 
@@ -283,6 +331,7 @@ export default function Home() {
       unitSystem,
       measurePoints: points,
       measureComplete: isComplete,
+      areas,
       selectedArea,
       placedEquipment,
       equipmentCatalog: equipment,
@@ -293,7 +342,7 @@ export default function Home() {
     setSavedLayouts(loadSavedLayouts());
     setSelectedLayoutId(saved.id);
     setActiveLayoutId(saved.id);
-  }, [activeTool, equipment, isComplete, mapView, points, placedEquipment, savedLayouts, selected, selectedArea, selectedLayoutId, unitSystem]);
+  }, [activeTool, areas, equipment, isComplete, mapView, points, placedEquipment, savedLayouts, selected, selectedArea, selectedLayoutId, unitSystem]);
 
   const handleLoadLayout = useCallback(() => {
     if (!selectedLayoutId) return;
@@ -369,6 +418,8 @@ export default function Home() {
               activeTool={activeTool}
               mapView={mapView}
               onMapViewChange={handleMapViewChange}
+              onToolChange={setActiveTool}
+              areas={areas}
               measurePoints={points}
               isMeasureComplete={isComplete}
               onMapClick={handleMeasureMapClick}
@@ -378,10 +429,12 @@ export default function Home() {
               onRemoveLastPoint={handleUndoMeasurePoint}
               selectedArea={selectedArea}
               totalDistance={totalM}
+              selectedEquipment={selected}
               placedEquipment={placedEquipment}
               pendingEquipmentDrop={pendingEquipmentDrop}
               onPendingEquipmentDropHandled={() => setPendingEquipmentDrop(null)}
               onPlaceEquipment={placeEquipment}
+              onPlaceEquipmentGroup={placeEquipmentGroup}
               onMoveEquipment={moveEquipment}
               onRotateEquipment={rotateEquipment}
               onDuplicateEquipment={duplicateEquipment}
@@ -399,8 +452,12 @@ export default function Home() {
                 {activeTool === "measure" ? `Measure: ${points.length} pts` : "Measure: off"}
               </span>
               <span className={`flex items-center gap-1.5 ${activeTool === "area" ? "text-[var(--accent-green)]" : ""}`}>
-                <span className={`w-1.5 h-1.5 rounded-full ${selectedArea ? "bg-[var(--accent-green)]" : "bg-[var(--border-bright)]"}`} />
-                {selectedArea ? `Area: ${selectedArea.widthM.toFixed(0)}×${selectedArea.heightM.toFixed(0)}m` : "Area: none"}
+                <span className={`w-1.5 h-1.5 rounded-full ${areas.length > 0 || selectedArea ? "bg-[var(--accent-green)]" : "bg-[var(--border-bright)]"}`} />
+                {areas.length > 0
+                  ? `Areas: ${areas.length}`
+                  : selectedArea
+                    ? `Area: ${selectedArea.widthM.toFixed(0)}×${selectedArea.heightM.toFixed(0)}m`
+                    : "Area: none"}
               </span>
               <span className={`flex items-center gap-1.5 ${selected ? "text-[var(--accent-cyan)]" : ""}`}>
                 <span className={`w-1.5 h-1.5 rounded-full ${selected ? "bg-[var(--accent-cyan)]" : "bg-[var(--border-bright)]"}`} />
@@ -414,6 +471,11 @@ export default function Home() {
             <EquipmentCalculator
               selectedArea={selectedArea}
               selectedEquipment={selected}
+              areas={areas}
+              placedEquipment={placedEquipment}
+              onSelectArea={setSelectedArea}
+              onRenameArea={renameArea}
+              onDeleteArea={deleteArea}
               onEquipmentDrop={select}
             />
           </Sidebar>

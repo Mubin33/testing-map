@@ -12,6 +12,7 @@ export interface SavedLayoutState {
   unitSystem: UnitSystem;
   measurePoints: MeasurePoint[];
   measureComplete: boolean;
+  areas: SelectedArea[];
   selectedArea: SelectedArea | null;
   placedEquipment: PlacedEquipment[];
   equipmentCatalog: Equipment[];
@@ -73,6 +74,7 @@ export function saveLayout(layout: Omit<SavedLayoutState, "version" | "savedAt" 
     unitSystem: layout.unitSystem,
     measurePoints: layout.measurePoints,
     measureComplete: layout.measureComplete,
+    areas: layout.areas,
     selectedArea: layout.selectedArea,
     placedEquipment: layout.placedEquipment,
     equipmentCatalog: layout.equipmentCatalog,
